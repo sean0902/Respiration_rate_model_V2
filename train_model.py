@@ -38,56 +38,87 @@ def get_positional_encoding(seq_len, d_model):
 
 # With square kernels, equal stride and dilation
 class MultiScaleDilationBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=3):
+    def __init__(self, in_ch, out_ch, kernel_size=3, dilation_rates=(1, 2, 4, 8)):
         super().__init__()
-        self.dilation_rates = [1, 2, 4, 8]
+        self.dilation_rates = list(dilation_rates)
+        self.num_branches = len(self.dilation_rates)
+
+        # ✅ out_ch 是 block 最終輸出 channel，所以每個 branch 要分配 channel
+        assert out_ch % self.num_branches == 0, \
+            f"out_ch({out_ch}) must be divisible by num_branches({self.num_branches})"
+
+        branch_ch = out_ch // self.num_branches
         self.convs = nn.ModuleList()
 
         for dilation in self.dilation_rates:
-            conv = Dcls1d(
-                in_channels=in_ch,
-                out_channels=out_ch,
-                kernel_count=kernel_size,
-                padding=(kernel_size - 1) * dilation // 2,
-                dilated_kernel_size=dilation
+            # ⚠️ Dcls1d 的 padding 行為不一定等同 Conv1d，
+            # 因此我們用 forward crop 對齊長度，而不是強依賴 padding
+            conv = nn.Sequential(
+                Dcls1d(
+                    in_channels=in_ch,
+                    out_channels=branch_ch,
+                    kernel_count=kernel_size,
+                    dilated_kernel_size=dilation
+                ),
+                nn.BatchNorm1d(branch_ch),
+                nn.ReLU()
             )
             self.convs.append(conv)
 
-        self.shortcut = nn.Sequential()
+        # ✅ shortcut 要對齊到 out_ch
         if in_ch != out_ch:
             self.shortcut = nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, kernel_size=1),
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False),
                 nn.BatchNorm1d(out_ch)
             )
+        else:
+            self.shortcut = nn.Identity()
+
         self.relu = nn.ReLU()
 
     def forward(self, x):
+        # branches: list of (B, branch_ch, T_i)
         out_branches = [conv(x) for conv in self.convs]
-        out = torch.cat(out_branches, dim=1)
+
+        # ✅ 對齊時間長度：裁切到最短（避免 Dcls1d 長度不一致）
+        min_len = min(o.size(-1) for o in out_branches)
+        out_branches = [o[..., :min_len] for o in out_branches]
+
+        out = torch.cat(out_branches, dim=1)  # (B, out_ch, min_len)
+
         residual = self.shortcut(x)
-        out += residual
+        if residual.size(-1) != min_len:
+            residual = residual[..., :min_len]
+
+        out = out + residual
         return self.relu(out)
 
 # CNN + Transformer
 class RadarBreathingModel(nn.Module):
     def __init__(self, in_channels=11, hidden_size=128, num_transformer_layers=1, num_classes=4):
         super().__init__()
+
         self.conv_block = nn.Sequential(
-            MultiScaleDilationBlock(in_channels, 16, kernel_size=7),
+            MultiScaleDilationBlock(in_channels, 16, kernel_size=7),  # -> (B,16,T')
             nn.MaxPool1d(kernel_size=2),
-            MultiScaleDilationBlock(16, 32, kernel_size=5),
+            MultiScaleDilationBlock(16, 32, kernel_size=5),           # -> (B,32,T'')
             nn.MaxPool1d(kernel_size=2),
-            MultiScaleDilationBlock(32, 64, kernel_size=3),
-            MultiScaleDilationBlock(64, 128, kernel_size=3),
-            MultiScaleDilationBlock(128, 128, kernel_size=3)
+            MultiScaleDilationBlock(32, 64, kernel_size=3),           # -> (B,64,T)
+            MultiScaleDilationBlock(64, 128, kernel_size=3),          # -> (B,128,T)
+            MultiScaleDilationBlock(128, 128, kernel_size=3)          # -> (B,128,T)
         )
+
+        # ✅ conv_block 輸出 channel=128，所以 projection input=128
         self.feature_projection = nn.Linear(128, hidden_size)
+
         transformer_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size, nhead=8, dim_feedforward=512, dropout=0.2, batch_first=True
+            d_model=hidden_size, nhead=8, dim_feedforward=512,
+            dropout=0.4, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_transformer_layers)
         self.layer_norm = nn.LayerNorm(hidden_size)
-        
+
+        # backbone feature
         self.dense = nn.Sequential(
             nn.Linear(hidden_size, 128),
             nn.BatchNorm1d(128),
@@ -95,14 +126,8 @@ class RadarBreathingModel(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
-            # nn.Dropout(0.4),
-            # nn.Linear(64, 32),
-            # nn.BatchNorm1d(32),
-            # nn.ReLU(),
-            # nn.Linear(32, 1)
+            nn.ReLU()
         )
-        # self.moe_head = RangeMoEHead(128, num_experts=5)
 
         self.reg_head = nn.Sequential(
             nn.Dropout(0.4),
@@ -117,51 +142,52 @@ class RadarBreathingModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, num_classes)
         )
+
     def forward(self, x):
-        x = self.conv_block(x)
-        x = x.permute(0, 2, 1)
-        x = self.feature_projection(x)
-        # pe = get_positional_encoding(x.size(1), x.size(2)).to(x.device)
-        # x = x + pe
-        x = self.transformer(x)
-        x = self.layer_norm(x[:, -1, :])
-        x = self.dense(x)
-        
-        # rr_output = self.moe_head(x)          # (B, 1)
-        rr_output = self.reg_head(x)          # (B, 1)
-        act_logits = self.activity_head(x)    # (B, num_classes)
+        # x: (B, C, T)
+        x = self.conv_block(x)        # (B, 128, T')
+        x = x.permute(0, 2, 1)        # (B, T', 128)
+        x = self.feature_projection(x) # (B, T', hidden)
+
+        x = self.transformer(x)       # (B, T', hidden)
+        x = self.layer_norm(x[:, -1, :])  # (B, hidden)
+
+        feat = self.dense(x)          # (B, 64)
+        rr_output = self.reg_head(feat)      # (B, 1)
+        act_logits = self.activity_head(feat) # (B, num_classes)
         return rr_output, act_logits
 
-# ---------- Multi-scale conv with GroupNorm ----------
-class MultiScaleDilationBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3):
-        super(MultiScaleDilationBlock, self).__init__()
-        self.dilation_rates = [1, 2, 4, 8]
-        self.convs = nn.ModuleList()
-        for dilation in self.dilation_rates:
-            padding = (kernel_size - 1) * dilation // 2
-            conv_branch = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels // len(self.dilation_rates), kernel_size, padding=padding, dilation=dilation),
-                nn.BatchNorm1d(out_channels // len(self.dilation_rates)),
-                nn.ReLU(),
-                nn.Conv1d(out_channels // len(self.dilation_rates), out_channels // len(self.dilation_rates), kernel_size, padding=padding, dilation=dilation),
-                nn.BatchNorm1d(out_channels // len(self.dilation_rates))
-            )
-            self.convs.append(conv_branch)
-        self.shortcut = nn.Sequential()
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1),
-                nn.BatchNorm1d(out_channels)
-            )
-        self.relu = nn.ReLU()
+
+# # ---------- Multi-scale conv with GroupNorm ----------
+# class MultiScaleDilationBlock(nn.Module):
+#     def __init__(self, in_channels, out_channels, kernel_size=3):
+#         super(MultiScaleDilationBlock, self).__init__()
+#         self.dilation_rates = [1, 2, 4, 8]
+#         self.convs = nn.ModuleList()
+#         for dilation in self.dilation_rates:
+#             padding = (kernel_size - 1) * dilation // 2
+#             conv_branch = nn.Sequential(
+#                 nn.Conv1d(in_channels, out_channels // len(self.dilation_rates), kernel_size, padding=padding, dilation=dilation),
+#                 nn.BatchNorm1d(out_channels // len(self.dilation_rates)),
+#                 nn.ReLU(),
+#                 nn.Conv1d(out_channels // len(self.dilation_rates), out_channels // len(self.dilation_rates), kernel_size, padding=padding, dilation=dilation),
+#                 nn.BatchNorm1d(out_channels // len(self.dilation_rates))
+#             )
+#             self.convs.append(conv_branch)
+#         self.shortcut = nn.Sequential()
+#         if in_channels != out_channels:
+#             self.shortcut = nn.Sequential(
+#                 nn.Conv1d(in_channels, out_channels, kernel_size=1),
+#                 nn.BatchNorm1d(out_channels)
+#             )
+#         self.relu = nn.ReLU()
     
-    def forward(self, x):
-        out_branches = [conv(x) for conv in self.convs]
-        out = torch.cat(out_branches, dim=1)
-        residual = self.shortcut(x)
-        out += residual
-        return self.relu(out)
+#     def forward(self, x):
+#         out_branches = [conv(x) for conv in self.convs]
+#         out = torch.cat(out_branches, dim=1)
+#         residual = self.shortcut(x)
+#         out += residual
+#         return self.relu(out)
 
 #     # ---------- Mixture-of-Experts Output Head ----------
 # class RangeMoEHead(nn.Module):
